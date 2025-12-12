@@ -1,0 +1,19 @@
+[
+  {
+    "major": "Organisation",
+    "minor": "minister"
+  },
+  {
+    "major": "Organisation",
+    "minor": "department"
+  },
+  {
+    "major": "Person",
+    "minor": "citizen"
+  },
+  {
+    "major": "Dataset",
+    "minor": "tabular"
+  }
+]
+
