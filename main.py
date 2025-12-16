@@ -303,89 +303,191 @@ async def get_entity_relations(entity_id: str) -> Any:
             return {"error": "Unexpected error", "details": str(e)}
 
 
-@app.get("/entities/{entity_id}/metadata-datasets")
-async def get_entity_metadata_and_datasets(entity_id: str) -> dict[str, Any]:
+@app.get("/entities/{entity_id}/metadata")
+async def get_entity_metadata(entity_id: str) -> dict[str, Any]:
     """
-    Get metadata and datasets for a specific entity.
-    Fetches metadata and relations in parallel, then matches datasets from cache.
+    Get metadata for a specific entity by ID.
+    Makes a fresh API call (does not use cache).
     """
     api_url = getattr(app.state, "api_url", None)
     if not api_url:
         return {"error": "API URL not configured"}
 
-    async def fetch_metadata(client: httpx.AsyncClient) -> dict[str, Any]:
-        """Fetch metadata for the entity."""
+    metadata_url = f"{api_url.rstrip('/')}/v1/entities/{entity_id}/metadata"
+    
+    async with httpx.AsyncClient() as client:
         try:
-            metadata_url = f"{api_url.rstrip('/')}/v1/entities/{entity_id}/metadata"
             metadata_resp = await client.get(metadata_url, timeout=30)
             metadata_resp.raise_for_status()
-            return metadata_resp.json()
+            metadata = metadata_resp.json()
+            return metadata if metadata else {}
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API returned {e.response.status_code}", "details": str(e)}
+        except httpx.RequestError as e:
+            return {"error": "Failed to connect to API", "details": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": "Unexpected error", "details": str(e)}
+
+
+@app.get("/entities/{entity_id}/categories-tree-datasets")
+async def get_entity_categories_tree(entity_id: str) -> Any:
+    """
+    Get categories tree for a specific entity by recursively fetching categories and datasets.
+    """
+    api_url = getattr(app.state, "api_url", None)
+    if not api_url:
+        return {"error": "API URL not configured"}
+
+    # Snapshot cache to resolve names
+    async with app.state.cache_lock:
+        cache_snapshot = app.state.kind_cache.get("data", [])
+
+    def build_name_lookup() -> tuple[dict[str, str], dict[str, str]]:
+        """Build lookup dictionaries for Category and Dataset names keyed by entity id."""
+        category_names: dict[str, str] = {}
+        dataset_names: dict[str, str] = {}
+        for entry in cache_snapshot:
+            if "error" in entry:
+                continue
+            pair = entry.get("pair", {})
+            major = pair.get("major")
+            result = entry.get("result", {})
+            body = result.get("body") if isinstance(result, dict) else None
+            if not isinstance(body, list):
+                continue
+            for item in body:
+                if not isinstance(item, dict):
+                    continue
+                ent_id = item.get("id")
+                name = item.get("name")
+                if not ent_id or name is None:
+                    continue
+                if major == "Category":
+                    category_names[ent_id] = name
+                if major == "Dataset":
+                    dataset_names[ent_id] = name
+        return category_names, dataset_names
+
+    category_names, dataset_names = build_name_lookup()
+
+    def decode_protobuf_name(encoded_name: str) -> str:
+        """Decode protobuf encoded name string.
+        
+        Format: {"typeUrl":"type.googleapis.com/google.protobuf.StringValue","value":"35656435623032666533"}
+        The value is hex-encoded bytes that need to be decoded to UTF-8.
+        """
+        try:
+            if not encoded_name or not isinstance(encoded_name, str):
+                return encoded_name
+            # Parse JSON string
+            parsed = json.loads(encoded_name)
+            if isinstance(parsed, dict) and "value" in parsed:
+                hex_value = parsed["value"]
+                # Decode hex to bytes, then to UTF-8 string
+                decoded_bytes = bytes.fromhex(hex_value)
+                return decoded_bytes.decode("utf-8")
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError):  # noqa: BLE001
+            # If decoding fails, return original
+            pass
+        return encoded_name
+
+    async def fetch_metadata(client: httpx.AsyncClient, target_id: str) -> dict[str, Any]:
+        """Fetch metadata for an entity id."""
+        try:
+            metadata_url = f"{api_url.rstrip('/')}/v1/entities/{target_id}/metadata"
+            resp = await client.get(metadata_url, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
         except Exception:  # noqa: BLE001
             return {}
 
-    async def fetch_relations(client: httpx.AsyncClient) -> list[dict[str, Any]]:
-        """Fetch relations for the entity."""
+    async def fetch_relations(
+        client: httpx.AsyncClient, 
+        entity_id: str, 
+        relation_name: str
+    ) -> list[dict[str, Any]]:
+        """Fetch relations for an entity with a specific relation name."""
         try:
             relations_url = f"{api_url.rstrip('/')}/v1/entities/{entity_id}/relations"
             relations_payload = {
                 "id": "",
                 "relatedEntityId": "",
-                "name": "AS_CATEGORY",
+                "name": relation_name,
                 "activeAt": "",
                 "startTime": "",
                 "endTime": "",
-                "direction": ""
+                "direction": "OUTGOING"
             }
-            relations_resp = await client.post(relations_url, json=relations_payload)
+            relations_resp = await client.post(relations_url, json=relations_payload, timeout=30)
             relations_resp.raise_for_status()
             relations_data = relations_resp.json()
             return relations_data if isinstance(relations_data, list) else []
         except Exception:  # noqa: BLE001
             return []
 
+    async def build_category_tree(
+        client: httpx.AsyncClient, 
+        entity_id: str
+    ) -> list[dict[str, Any]]:
+        """Recursively build the categories tree for an entity."""
+        # Get AS_CATEGORY relations
+        categories = await fetch_relations(client, entity_id, "AS_CATEGORY")
+        # Replace relation names with actual category names when available, drop id
+        for cat in categories:
+            if isinstance(cat, dict):
+                cat.pop("id", None)  # Drop id field
+                rid = cat.get("relatedEntityId")
+                if rid and rid in category_names:
+                    cat["name"] = category_names[rid]
+        
+        if not categories:
+            # No categories: fetch attributes and metadata for this entity in parallel
+            attributes, metadata = await asyncio.gather(
+                fetch_relations(client, entity_id, "IS_ATTRIBUTE"),
+                fetch_metadata(client, entity_id),
+            )
+            for attr in attributes:
+                if isinstance(attr, dict):
+                    attr.pop("id", None)  # Drop id field
+                    rid = attr.get("relatedEntityId")
+                    print(f"Processing attribute, rid: {rid}, in dataset_names: {rid in dataset_names if rid else False}")
+                    if rid and rid in dataset_names:
+                        encoded_name = dataset_names[rid]
+                        decoded_name = decode_protobuf_name(encoded_name)
+                        # Match with metadata: if key exists, use its value and pop it
+                        if decoded_name in metadata:
+                            attr["name"] = metadata.pop(decoded_name)
+                        else:
+                            attr["name"] = None
+            return {"children": attributes if attributes else []}
+        
+        # If categories exist, recursively fetch children in parallel
+        async def process_category(category: dict[str, Any]) -> dict[str, Any]:
+            related_id = category.get("relatedEntityId", "")
+            if related_id:
+                children_result = await build_category_tree(client, related_id)
+                # If result is a dict with "children" (attributes case), extract the children
+                if isinstance(children_result, dict) and "children" in children_result:
+                    children = children_result["children"]
+                else:
+                    children = children_result if children_result else []
+                return {
+                    **category,
+                    "children": children
+                }
+            # No related id; still return category
+            return category
+        
+        # Process all categories in parallel
+        tasks = [process_category(cat) for cat in categories]
+        processed_categories = await asyncio.gather(*tasks)
+        
+        return processed_categories
+
     async with httpx.AsyncClient() as client:
-        # Fetch metadata and relations in parallel
-        metadata, relations_data = await asyncio.gather(
-            fetch_metadata(client),
-            fetch_relations(client)
-        )
-
-    # Process relations and match with cache
-    datasets = []
-    try:
-        # Extract relatedEntityId values
-        related_ids = []
-        for relation in relations_data:
-            if isinstance(relation, dict) and "relatedEntityId" in relation:
-                related_ids.append(relation["relatedEntityId"])
-        
-        # Match with cache for Dataset/tabular
-        async with app.state.cache_lock:
-            cache = app.state.kind_cache
-            entries = cache.get("data", [])
-        
-        # Find Dataset/tabular entry in cache
-        dataset_entry = None
-        for entry in entries:
-            pair = entry.get("pair", {})
-            if pair.get("major") == "Dataset" and pair.get("minor") == "tabular":
-                if "error" not in entry:
-                    dataset_entry = entry
-                break
-        
-        if dataset_entry:
-            result = dataset_entry.get("result", {})
-            body = result.get("body") if isinstance(result, dict) else []
-            if isinstance(body, list):
-                # Match entities by id
-                for entity in body:
-                    if isinstance(entity, dict) and entity.get("id") in related_ids:
-                        datasets.append(entity)
-    except Exception:  # noqa: BLE001
-        # If processing fails, just use empty list
-        datasets = []
-
-    return {
-        "metadata": metadata if metadata else {},
-        "datasets": datasets if datasets else []
-    }
+        try:
+            result = await build_category_tree(client, entity_id)
+            return result
+        except Exception as e:  # noqa: BLE001
+            return {"error": "Unexpected error", "details": str(e)}

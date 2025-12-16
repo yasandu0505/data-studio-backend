@@ -14,6 +14,22 @@
   {
     "major": "Dataset",
     "minor": "tabular"
+  },
+  {
+    "major": "Document",
+    "minor": "extgztorg"
+  },
+  {
+    "major": "Document",
+    "minor": "extgztperson"
+  },
+  {
+    "major": "Category",
+    "minor": "parentCategory"
+  },
+  {
+    "major": "Category",
+    "minor": "childCategory"
   }
 ]
 
