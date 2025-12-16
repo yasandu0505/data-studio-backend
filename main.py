@@ -491,3 +491,48 @@ async def get_entity_categories_tree(entity_id: str) -> Any:
             return result
         except Exception as e:  # noqa: BLE001
             return {"error": "Unexpected error", "details": str(e)}
+
+
+@app.post("/entities/{entity_id}/metadata-add")
+async def add_entity_metadata(entity_id: str, payload: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Add entity metadata by sending a PUT request to the write API.
+    Accepts a payload like [{"key": "value"}, {"key": "value"}] and uses it directly as metadata.
+    """
+    write_api_url = os.getenv("OPENGIN_WRITE_API")
+    if not write_api_url:
+        return {"error": "OPENGIN_WRITE_API environment variable is required"}
+
+    # Check for duplicate keys across all objects in the payload
+    all_keys = []
+    for item in payload:
+        if isinstance(item, dict):
+            all_keys.extend(item.keys())
+    
+    # Check if any key appears more than once
+    if len(all_keys) != len(set(all_keys)):
+        return {"error": "can't have same key"}
+
+    # Use payload directly as metadata
+    metadata = payload
+
+    # Prepare the request payload
+    request_payload = {
+        "id": entity_id,
+        "metadata": metadata
+    }
+    print(f"Request payload: {request_payload}")
+    
+    url = f"{write_api_url.rstrip('/')}/entities/{entity_id}"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.put(url, json=request_payload, timeout=30)
+            resp.raise_for_status()
+            return resp.json() 
+        except httpx.HTTPStatusError as e:
+            return {"error": f"API returned {e.response.status_code}"}
+        except httpx.RequestError as e:
+            return {"error": "Failed to connect to API", "details": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"error": "Unexpected error", "details": str(e)}
